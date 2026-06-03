@@ -30,6 +30,7 @@ import (
 type Kubernetes struct {
 	dynamicClient     dynamic.Interface
 	clientSet         kubernetes.Interface
+	factory           dynamicinformer.DynamicSharedInformerFactory
 	ClusterHost       string
 	Mode              string // "in-cluster" or "out-of-cluster"
 	KubeVersion       string
@@ -60,7 +61,7 @@ const (
 
 // NewKubernetes creates a new Kubernetes service instance
 // - needs an SSE broker to send events to connected clients
-func NewKubernetes(sseBroker *sse.Broker[KubeEvent], singleNamespace string) (*Kubernetes, error) {
+func NewKubernetes(sseBroker *sse.Broker[KubeEvent], singleNamespace string, listOnly bool) (*Kubernetes, error) {
 	var kubeConfig *rest.Config
 
 	var err error
@@ -164,6 +165,10 @@ func NewKubernetes(sseBroker *sse.Broker[KubeEvent], singleNamespace string) (*K
 		Informer().
 		AddEventHandler(getHandlerFuncs(sseBroker))
 
+	_, _ = factory.ForResource(schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "daemonsets"}).
+		Informer().
+		AddEventHandler(getHandlerFuncs(sseBroker))
+
 	_, _ = factory.ForResource(schema.GroupVersionResource{Group: "networking.k8s.io",
 		Version: "v1", Resource: "ingresses"}).
 		Informer().
@@ -210,12 +215,22 @@ func NewKubernetes(sseBroker *sse.Broker[KubeEvent], singleNamespace string) (*K
 		Informer().
 		AddEventHandler(getHandlerFuncs(sseBroker))
 
-	factory.Start(context.Background().Done())
-	factory.WaitForCacheSync(context.Background().Done())
+	// List-only mode: skip starting the informers and the blocking cache sync.
+	// The handlers/informers above are created but inert (no list/watch network
+	// calls happen until factory.Start), so the HTTP server binds immediately
+	// even on RBAC-restricted clusters. /api/fetch and /updates read empty
+	// caches in this mode and are not used by the client here.
+	if !listOnly {
+		factory.Start(context.Background().Done())
+		factory.WaitForCacheSync(context.Background().Done())
+	} else {
+		log.Println("📋 List-only mode: skipping resource watchers")
+	}
 
 	return &Kubernetes{
 		dynamicClient:     dynamicClient,
 		clientSet:         clientSet, // Deprecated, use client instead
+		factory:           factory,
 		ClusterHost:       kubeConfig.Host,
 		Mode:              mode,
 		UseEndpointSlices: useEndpointSlices,
@@ -254,52 +269,47 @@ func (k *Kubernetes) CheckNamespaceExists(ns string) bool {
 	return err == nil
 }
 
-// Retrieves all resources in a specific namespace and returns them in a big ol' map
+// Retrieves all resources in a specific namespace and returns them in a big ol' map.
+// Reads from the in-memory informer cache populated by NewKubernetes, avoiding
+// per-request List calls against the API server.
 func (k *Kubernetes) FetchNamespace(ns string) (map[string][]unstructured.Unstructured, error) {
 	if ns == "" {
 		return nil, errors.New("namespace is empty")
 	}
 
-	data := make(map[string][]unstructured.Unstructured)
+	type kindGVR struct {
+		key string
+		gvr schema.GroupVersionResource
+	}
 
-	podList, _ := k.GetResources(ns, "", "v1", "pods")
-	serviceList, _ := k.GetResources(ns, "", "v1", "services")
-	// endpointList, _ := k.getResources(ns, "", "v1", "endpoints")
-	deploymentList, _ := k.GetResources(ns, "apps", "v1", "deployments")
-	replicaSetList, _ := k.GetResources(ns, "apps", "v1", "replicasets")
-	statefulSetList, _ := k.GetResources(ns, "apps", "v1", "statefulsets")
-	daemonSetList, _ := k.GetResources(ns, "apps", "v1", "daemonsets")
-	jobList, _ := k.GetResources(ns, "batch", "v1", "jobs")
-	cronJobList, _ := k.GetResources(ns, "batch", "v1", "cronjobs")
-	ingressList, _ := k.GetResources(ns, "networking.k8s.io", "v1", "ingresses")
-	confMapList, _ := k.GetResources(ns, "", "v1", "configmaps")
-	secretList, _ := k.GetResources(ns, "", "v1", "secrets")
-	pvcList, _ := k.GetResources(ns, "", "v1", "persistentvolumeclaims")
-	eventList, _ := k.GetResources(ns, "", "v1", "events")
-	hpaList, _ := k.GetResources(ns, "autoscaling", "v2", "horizontalpodautoscalers")
+	kinds := []kindGVR{
+		{"pods", schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}},
+		{"services", schema.GroupVersionResource{Group: "", Version: "v1", Resource: "services"}},
+		{"deployments", schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "deployments"}},
+		{"replicasets", schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "replicasets"}},
+		{"statefulsets", schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "statefulsets"}},
+		{"daemonsets", schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "daemonsets"}},
+		{"jobs", schema.GroupVersionResource{Group: "batch", Version: "v1", Resource: "jobs"}},
+		{"cronjobs", schema.GroupVersionResource{Group: "batch", Version: "v1", Resource: "cronjobs"}},
+		{"ingresses", schema.GroupVersionResource{Group: "networking.k8s.io", Version: "v1", Resource: "ingresses"}},
+		{"configmaps", schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"}},
+		{"secrets", schema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}},
+		{"persistentvolumeclaims", schema.GroupVersionResource{Group: "", Version: "v1", Resource: "persistentvolumeclaims"}},
+		{"events", schema.GroupVersionResource{Group: "", Version: "v1", Resource: "events"}},
+		{"horizontalpodautoscalers", schema.GroupVersionResource{Group: "autoscaling", Version: "v2", Resource: "horizontalpodautoscalers"}},
+	}
 
-	data["pods"] = podList
-	data["services"] = serviceList
-	data["deployments"] = deploymentList
-	data["replicasets"] = replicaSetList
-	data["statefulsets"] = statefulSetList
-	data["daemonsets"] = daemonSetList
-	data["jobs"] = jobList
-	data["cronjobs"] = cronJobList
-	data["ingresses"] = ingressList
-	data["configmaps"] = confMapList
-	data["secrets"] = secretList
-	data["persistentvolumeclaims"] = pvcList
-	data["events"] = eventList
-	data["horizontalpodautoscalers"] = hpaList
+	data := make(map[string][]unstructured.Unstructured, len(kinds)+1)
+	for _, kg := range kinds {
+		data[kg.key] = k.listFromCache(kg.gvr, ns)
+	}
 
-	// If we are using EndpointSlices, get those instead of Endpoints
 	if k.UseEndpointSlices {
-		endpointList, _ := k.GetResources(ns, "discovery.k8s.io", "v1", "endpointslices")
-		data["endpointslices"] = endpointList
+		data["endpointslices"] = k.listFromCache(
+			schema.GroupVersionResource{Group: "discovery.k8s.io", Version: "v1", Resource: "endpointslices"}, ns)
 	} else {
-		endpointList, _ := k.GetResources(ns, "", "v1", "endpoints")
-		data["endpoints"] = endpointList
+		data["endpoints"] = k.listFromCache(
+			schema.GroupVersionResource{Group: "", Version: "v1", Resource: "endpoints"}, ns)
 	}
 
 	// Clean up the managed fields and redact sensitive data
@@ -320,6 +330,34 @@ func (k *Kubernetes) FetchNamespace(ns string) (map[string][]unstructured.Unstru
 	}
 
 	return data, nil
+}
+
+// listFromCache returns deep-copied resources of the given GVR scoped to the
+// namespace, read from the shared informer's local cache. Returns an empty
+// slice (never nil) if the informer is unregistered or the cache is empty,
+// preserving the JSON shape returned by FetchNamespace.
+func (k *Kubernetes) listFromCache(gvr schema.GroupVersionResource, ns string) []unstructured.Unstructured {
+	out := []unstructured.Unstructured{}
+
+	if k.factory == nil {
+		return out
+	}
+
+	informer := k.factory.ForResource(gvr).Informer()
+	for _, obj := range informer.GetIndexer().List() {
+		u, ok := obj.(*unstructured.Unstructured)
+		if !ok {
+			continue
+		}
+
+		if u.GetNamespace() != ns {
+			continue
+		}
+
+		out = append(out, *u.DeepCopy())
+	}
+
+	return out
 }
 
 // Generic function to list resources from a specific namespace
@@ -369,16 +407,30 @@ func inCluster() bool {
 	return false
 }
 
-// getHandlerFuncs returns the event handlers for the Kubernetes informers, which send events through the SSE broker
+// getHandlerFuncs returns the event handlers for the Kubernetes informers, which send events through the SSE broker.
+//
+// Each handler DeepCopies the incoming object before mutating it. The informer
+// hands out a pointer to the object held in the shared cache, and the listener
+// callbacks run on a goroutine pool concurrent with the informer's own delta
+// processing. Mutating the cached pointer races against `MetaNamespaceIndexFunc`
+// reads that happen inside the informer's `threadSafeMap` updates (Go's
+// runtime catches this as `fatal error: concurrent map read and map write`).
+// The DeepCopy makes the SSE pipeline operate on a private clone, leaving the
+// cache pristine for the Pack-2 cache-read path used by FetchNamespace.
 func getHandlerFuncs(b *sse.Broker[KubeEvent]) cache.ResourceEventHandlerFuncs {
 	return cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			u := obj.(*unstructured.Unstructured)
-			namespace := u.GetNamespace()
+			orig, ok := obj.(*unstructured.Unstructured)
+			if !ok {
+				return
+			}
+
+			namespace := orig.GetNamespace()
 			if namespace == "" {
 				return
 			}
 
+			u := orig.DeepCopy()
 			u.SetManagedFields(nil)
 			b.SendToGroup(namespace, KubeEvent{
 				EventType: AddEvent,
@@ -387,12 +439,17 @@ func getHandlerFuncs(b *sse.Broker[KubeEvent]) cache.ResourceEventHandlerFuncs {
 		},
 
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			u := newObj.(*unstructured.Unstructured)
-			namespace := u.GetNamespace()
+			orig, ok := newObj.(*unstructured.Unstructured)
+			if !ok {
+				return
+			}
+
+			namespace := orig.GetNamespace()
 			if namespace == "" {
 				return
 			}
 
+			u := orig.DeepCopy()
 			u.SetManagedFields(nil)
 			b.SendToGroup(namespace, KubeEvent{
 				EventType: UpdateEvent,
@@ -401,12 +458,17 @@ func getHandlerFuncs(b *sse.Broker[KubeEvent]) cache.ResourceEventHandlerFuncs {
 		},
 
 		DeleteFunc: func(obj interface{}) {
-			u := obj.(*unstructured.Unstructured)
-			namespace := u.GetNamespace()
+			orig, ok := obj.(*unstructured.Unstructured)
+			if !ok {
+				return
+			}
+
+			namespace := orig.GetNamespace()
 			if namespace == "" {
 				return
 			}
 
+			u := orig.DeepCopy()
 			u.SetManagedFields(nil)
 			b.SendToGroup(namespace, KubeEvent{
 				EventType: DeleteEvent,

@@ -15,6 +15,7 @@ import (
 	"github.com/benc-uk/go-rest-api/pkg/problem"
 	kubeview "github.com/benc-uk/kubeview"
 	"github.com/go-chi/chi/v5"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 // All application routes are defined here
@@ -77,42 +78,53 @@ func (s *KubeviewAPI) handleNamespaceList(w http.ResponseWriter, r *http.Request
 
 	var err error
 
-	if s.config.SingleNamespace != "" {
-		// If SingleNamespace is set, we only return that namespace
-		namespaces = []string{s.config.SingleNamespace}
-	} else {
-		namespaces, err = s.kubeService.GetNamespaces()
-		if err != nil {
+	// Always return the full namespace list (a direct API List). We intentionally
+	// do NOT collapse to SingleNamespace here: k8sview watches one namespace
+	// (scoped informers) but still needs the full list to drive the namespace
+	// picker. The /api/fetch handler keeps its single-namespace enforcement.
+	canListNamespaces := true
+
+	namespaces, err = s.kubeService.GetNamespaces()
+	if err != nil {
+		if apierrors.IsForbidden(err) {
+			// RBAC-restricted identity: cannot enumerate namespaces. Come up
+			// anyway with an empty list and a flag, so the client stays usable
+			// and lets the user type the namespace they DO have access to.
+			log.Println("🔒 Not authorised to list namespaces; client must specify one")
+			namespaces = []string{}
+			canListNamespaces = false
+		} else {
 			problem.Wrap(500, r.RequestURI, "namespaces", err).Send(w)
 			return
 		}
+	}
 
-		// Remove namespaces that are in the filter, filter is a regex
-		if s.config.NameSpaceFilter != "" {
-			filteredNamespaces := make([]string, 0, len(namespaces))
+	// Remove namespaces that are in the filter, filter is a regex
+	if canListNamespaces && s.config.NameSpaceFilter != "" {
+		filteredNamespaces := make([]string, 0, len(namespaces))
 
-			for _, ns := range namespaces {
-				if matched, err := regexp.MatchString(s.config.NameSpaceFilter, ns); !matched && err == nil {
-					filteredNamespaces = append(filteredNamespaces, ns)
-				}
+		for _, ns := range namespaces {
+			if matched, err := regexp.MatchString(s.config.NameSpaceFilter, ns); !matched && err == nil {
+				filteredNamespaces = append(filteredNamespaces, ns)
 			}
-
-			if len(filteredNamespaces) == 0 {
-				problem.Wrap(500, r.RequestURI, "no namespaces found",
-					errors.New("no namespaces match the filter")).Send(w)
-				return
-			}
-
-			namespaces = filteredNamespaces
 		}
+
+		if len(filteredNamespaces) == 0 {
+			problem.Wrap(500, r.RequestURI, "no namespaces found",
+				errors.New("no namespaces match the filter")).Send(w)
+			return
+		}
+
+		namespaces = filteredNamespaces
 	}
 
 	res := NamespaceListResult{
-		ClusterHost: s.kubeService.ClusterHost,
-		Namespaces:  namespaces,
-		Version:     s.Version,
-		BuildInfo:   s.BuildInfo,
-		Mode:        s.kubeService.Mode,
+		ClusterHost:       s.kubeService.ClusterHost,
+		Namespaces:        namespaces,
+		CanListNamespaces: canListNamespaces,
+		Version:           s.Version,
+		BuildInfo:         s.BuildInfo,
+		Mode:              s.kubeService.Mode,
 	}
 
 	s.ReturnJSON(w, res)
