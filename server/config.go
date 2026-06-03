@@ -11,11 +11,12 @@ import (
 
 // Config holds the configuration for the system
 type Config struct {
-	Port            int
-	NameSpaceFilter string
-	SingleNamespace string
-	Debug           bool
-	EnablePodLogs   bool
+	Port               int
+	NameSpaceFilter    string
+	SingleNamespace    string
+	ListNamespacesOnly bool
+	Debug              bool
+	EnablePodLogs      bool
 }
 
 // Parse the environment variables and return a Config struct
@@ -25,6 +26,7 @@ func getConfig() Config {
 	port := 8000
 	nameSpaceFilter := ""
 	singleNamespace := ""
+	listNamespacesOnly := false
 	debug := false
 	enablePodLogs := true
 
@@ -42,6 +44,14 @@ func getConfig() Config {
 		nameSpaceFilter = s
 	}
 
+	// List-only bootstrap mode: serve the namespace list without setting up any
+	// informers (no cluster-wide list/watch), so the HTTP server binds even on
+	// RBAC-restricted clusters. The client uses this to populate the namespace
+	// picker, then restarts the sidecar scoped via SINGLE_NAMESPACE.
+	if s := os.Getenv("LIST_NAMESPACES_ONLY"); s != "" {
+		listNamespacesOnly = true
+	}
+
 	if s := os.Getenv("DISABLE_POD_LOGS"); s != "" {
 		if enable, err := strconv.ParseBool(s); err == nil {
 			enablePodLogs = !enable
@@ -53,10 +63,11 @@ func getConfig() Config {
 	}
 
 	return Config{
-		Port:            port,
-		NameSpaceFilter: nameSpaceFilter,
-		SingleNamespace: singleNamespace,
-		Debug:           debug,
-		EnablePodLogs:   enablePodLogs,
+		Port:               port,
+		NameSpaceFilter:    nameSpaceFilter,
+		SingleNamespace:    singleNamespace,
+		ListNamespacesOnly: listNamespacesOnly,
+		Debug:              debug,
+		EnablePodLogs:      enablePodLogs,
 	}
 }

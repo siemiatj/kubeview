@@ -21,6 +21,10 @@ type KubeviewAPI struct {
 
 type NamespaceListResult struct {
 	Namespaces []string `json:"namespaces"`
+	// CanListNamespaces is false when the identity lacks cluster-scope
+	// namespaces.list permission (RBAC-restricted clusters). In that case
+	// Namespaces is empty and the client must let the user type a namespace.
+	CanListNamespaces bool `json:"canListNamespaces"`
 	// We munge a couple of extra fields into the API response
 	// This saves us from having to make a separate request for the version and build info
 	ClusterHost    string `json:"clusterHost"`
@@ -34,7 +38,7 @@ func NewKubeviewAPI(conf Config) *KubeviewAPI {
 	broker := newKubeEventBroker(conf)
 
 	// Create a new Kubernetes service instance, which will connect to the cluster
-	kubeSvc, err := services.NewKubernetes(broker.Broker, conf.SingleNamespace)
+	kubeSvc, err := services.NewKubernetes(broker.Broker, conf.SingleNamespace, conf.ListNamespacesOnly)
 	if err != nil {
 		log.Fatalf("💥 Error connecting to Kubernetes, system will exit")
 	}

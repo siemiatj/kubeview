@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/dynamic/fake"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 )
@@ -50,9 +51,18 @@ func mockKubernetes() *Kubernetes {
 	// Create fake clientset
 	fakeClientSet := k8sfake.NewClientset()
 
+	// Build an informer factory wrapping the fake client. The factory is not
+	// Started here; tests that exercise the cache-read path seed the indexer
+	// directly via factory.ForResource(gvr).Informer().GetIndexer().Add(obj).
+	factory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(fakeDynamicClient, 0, "", nil)
+	for gvr := range gvrToListKind {
+		_ = factory.ForResource(gvr).Informer()
+	}
+
 	return &Kubernetes{
 		dynamicClient:     fakeDynamicClient,
 		clientSet:         fakeClientSet,
+		factory:           factory,
 		ClusterHost:       "https://test-cluster",
 		Mode:              "test",
 		UseEndpointSlices: false,
@@ -222,15 +232,26 @@ func TestKubernetes_FetchNamespace(t *testing.T) {
 
 	// Create test resources
 	pod := createTestPod("test-pod", "default")
+	otherPod := createTestPod("other-pod", "other-namespace")
 	secret := createTestSecret("test-secret", "default")
 
-	// Add resources to the fake client
+	// Seed the informer caches directly. The cache-read path used by
+	// FetchNamespace does not read through the dynamic client, so we add
+	// objects to the indexers the factory exposes.
 	podGvr := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
 	secretGvr := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "secrets"}
 
-	_, _ = k.dynamicClient.Resource(podGvr).Namespace("default").Create(context.TODO(), pod, metaV1.CreateOptions{})
-	_, _ = k.dynamicClient.Resource(secretGvr).Namespace("default").
-		Create(context.TODO(), secret, metaV1.CreateOptions{})
+	if err := k.factory.ForResource(podGvr).Informer().GetIndexer().Add(pod); err != nil {
+		t.Fatalf("failed to seed pod: %v", err)
+	}
+
+	if err := k.factory.ForResource(podGvr).Informer().GetIndexer().Add(otherPod); err != nil {
+		t.Fatalf("failed to seed other-namespace pod: %v", err)
+	}
+
+	if err := k.factory.ForResource(secretGvr).Informer().GetIndexer().Add(secret); err != nil {
+		t.Fatalf("failed to seed secret: %v", err)
+	}
 
 	// Test FetchNamespace
 	data, err := k.FetchNamespace("default")
@@ -238,16 +259,35 @@ func TestKubernetes_FetchNamespace(t *testing.T) {
 		t.Fatalf("Expected no error, got %v", err)
 	}
 
-	// Check that data contains expected resource types
-	expectedTypes := []string{"pods", "services", "deployments", "secrets", "configmaps"}
+	// Check that data contains expected resource types (response shape)
+	expectedTypes := []string{
+		"pods", "services", "deployments", "replicasets", "statefulsets", "daemonsets",
+		"jobs", "cronjobs", "ingresses", "configmaps", "secrets",
+		"persistentvolumeclaims", "events", "horizontalpodautoscalers",
+	}
 	for _, resourceType := range expectedTypes {
 		if _, exists := data[resourceType]; !exists {
 			t.Errorf("Expected resource type %s to be present in data", resourceType)
 		}
 	}
 
+	// UseEndpointSlices=false in the mock, so endpoints key should be present
+	if _, exists := data["endpoints"]; !exists {
+		t.Error("Expected 'endpoints' key in response (UseEndpointSlices=false)")
+	}
+
+	// Namespace filter: the pod we seeded into "default" must come through,
+	// the pod in "other-namespace" must not.
+	if len(data["pods"]) != 1 {
+		t.Errorf("Expected 1 pod in default namespace, got %d", len(data["pods"]))
+	} else if data["pods"][0].GetName() != "test-pod" {
+		t.Errorf("Expected pod 'test-pod' in default namespace, got %s", data["pods"][0].GetName())
+	}
+
 	// Check that secrets are redacted
-	if secrets, ok := data["secrets"]; ok && len(secrets) > 0 {
+	if secrets, ok := data["secrets"]; !ok || len(secrets) == 0 {
+		t.Error("Expected at least one secret in default namespace, found none")
+	} else {
 		secretData, exists := secrets[0].Object["data"].(map[string]interface{})
 		if !exists {
 			t.Error("Expected secret to have data field")
